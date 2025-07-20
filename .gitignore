@@ -11,6 +11,8 @@ dist/
 .next/
 out/
 
+api_doc.md
+
 # Environment variables
 .env
 .env.local
