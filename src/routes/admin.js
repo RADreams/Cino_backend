@@ -32,6 +32,12 @@ const upload = multer({
 // Apply strict rate limiting to all admin routes
 router.use(strictLimiter);
 
+// Add requireAdmin to all routes except /login
+router.use((req, res, next) => {
+  if (req.path === '/login') return next();
+  return require('../middleware/auth').requireAdmin(req, res, next);
+});
+
 /**
  * @route   POST /api/admin/login
  * @desc    Admin login (for demo/testing)
