@@ -5,8 +5,7 @@ const analyticsSchema = new mongoose.Schema({
   eventId: {
     type: String,
     required: true,
-    unique: true,
-    index: true
+    unique: true
   },
 
   // Event categorization
@@ -18,8 +17,7 @@ const analyticsSchema = new mongoose.Schema({
       'swipe_left', 'swipe_right', 'tap_episode', 'like', 'share',
       'app_open', 'app_close', 'session_start', 'session_end',
       'content_view', 'search', 'error', 'buffer_start', 'buffer_end'
-    ],
-    index: true
+    ]
   },
 
   category: {
@@ -29,8 +27,8 @@ const analyticsSchema = new mongoose.Schema({
   },
 
   // User and session context
-  userId: { type: String, required: true, index: true },
-  sessionId: { type: String, index: true },
+  userId: { type: String, required: true },
+  sessionId: { type: String },
   
   // Content context
   contentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Content' },

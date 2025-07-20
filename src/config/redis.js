@@ -5,8 +5,11 @@ let redisClient = null;
 const connectRedis = async () => {
   try {
     const redisConfig = {
-      host: process.env.REDIS_HOST || 'localhost',
-      port: process.env.REDIS_PORT || 6379,
+      socket: {
+        host: process.env.REDIS_HOST || 'localhost',
+        port: process.env.REDIS_PORT ? parseInt(process.env.REDIS_PORT) : 6379,
+        ...(process.env.REDIS_TLS === 'true' && { tls: true })
+      },
       retryDelayOnFailover: 100,
       enableReadyCheck: true,
       maxRetriesPerRequest: 3,

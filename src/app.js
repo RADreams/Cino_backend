@@ -7,11 +7,11 @@ require('dotenv').config();
 
 // Import configurations
 const connectDB = require('./config/database');
-const connectRedis = require('./config/redis');
+const { connectRedis } = require('./config/redis');
 
 // Import middleware
-const errorHandler = require('./middleware/errorHandler');
-const rateLimiter = require('./middleware/rateLimiter');
+const { errorHandler } = require('./middleware/errorHandler');
+const { generalLimiter } = require('./middleware/rateLimiter');
 
 // Import routes
 const userRoutes = require('./routes/users');
@@ -44,7 +44,7 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Rate limiting
-app.use('/api/', rateLimiter);
+app.use('/api/', generalLimiter);
 
 // Health check endpoint
 app.get('/health', (req, res) => {

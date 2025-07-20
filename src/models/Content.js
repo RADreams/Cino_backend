@@ -4,8 +4,7 @@ const contentSchema = new mongoose.Schema({
   contentId: {
     type: String,
     required: true,
-    unique: true,
-    index: true
+    unique: true
   },
 
   // Basic content information
@@ -112,7 +111,6 @@ const contentSchema = new mongoose.Schema({
 });
 
 // Indexes for better performance
-contentSchema.index({ contentId: 1 });
 contentSchema.index({ type: 1, status: 1 });
 contentSchema.index({ genre: 1 });
 contentSchema.index({ language: 1 });

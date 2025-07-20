@@ -4,16 +4,14 @@ const episodeSchema = new mongoose.Schema({
   episodeId: {
     type: String,
     required: true,
-    unique: true,
-    index: true
+    unique: true
   },
 
   // Episode identification
   contentId: { 
     type: mongoose.Schema.Types.ObjectId, 
     ref: 'Content', 
-    required: true,
-    index: true
+    required: true
   },
   
   episodeNumber: { type: Number, required: true },
@@ -113,14 +111,13 @@ const episodeSchema = new mongoose.Schema({
 });
 
 // Indexes for better performance
-episodeSchema.index({ episodeId: 1 });
 episodeSchema.index({ contentId: 1, episodeNumber: 1 });
 episodeSchema.index({ contentId: 1, seasonNumber: 1, episodeNumber: 1 });
 episodeSchema.index({ status: 1, publishedAt: -1 });
 episodeSchema.index({ 'analytics.totalViews': -1 });
 
 // Compound indexes for episode navigation
-episodeSchema.index({ contentId: 1, episodeNumber: 1 }, { unique: true });
+episodeSchema.index( { unique: true });
 
 // Virtual for streaming URL with query parameters
 episodeSchema.virtual('streamUrl').get(function() {

@@ -6,8 +6,7 @@ const userSchema = new mongoose.Schema({
     type: String,
     default: uuidv4,
     unique: true,
-    required: true,
-    index: true
+    required: true
   },
   
   // Device and session info
@@ -82,7 +81,6 @@ const userSchema = new mongoose.Schema({
 });
 
 // Indexes for better performance
-userSchema.index({ userId: 1 });
 userSchema.index({ 'deviceInfo.deviceId': 1 });
 userSchema.index({ lastSeenAt: -1 });
 userSchema.index({ status: 1 });

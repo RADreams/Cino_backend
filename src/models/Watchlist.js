@@ -3,15 +3,13 @@ const mongoose = require('mongoose');
 const watchlistSchema = new mongoose.Schema({
   userId: {
     type: String,
-    required: true,
-    index: true
+    required: true
   },
 
   contentId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Content',
-    required: true,
-    index: true
+    required: true
   },
 
   episodeId: {
