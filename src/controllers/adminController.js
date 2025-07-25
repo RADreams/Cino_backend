@@ -3,13 +3,15 @@ const Episode = require('../models/Episode');
 const User = require('../models/User');
 const Watchlist = require('../models/Watchlist');
 const Analytics = require('../models/Analytics');
-const { uploadVideoToGCP, deleteVideoFromGCP } = require('../config/gcp');
-const gcpService = require('../services/gcpService');
 const { deleteCache, flushCache } = require('../config/redis');
 const { asyncHandler, AppError } = require('../middleware/errorHandler');
 const { v4: uuidv4 } = require('uuid');
 const storageService = require('../services/storageService');
 const cdnService = require('../services/cdnService');
+const videoService = require('../services/videoService');
+const path = require('path');
+const fs = require('fs').promises;
+const { spawn } = require('child_process');
 
 // Create new content
 const createContent = asyncHandler(async (req, res) => {
@@ -60,7 +62,135 @@ const createContent = asyncHandler(async (req, res) => {
   });
 });
 
-// Upload video and create episode
+// Enhanced video processing with FFmpeg
+const processVideoWithFFmpeg = async (inputBuffer, outputPath, quality = '720p') => {
+  return new Promise((resolve, reject) => {
+    const tempInputPath = `/tmp/input_${Date.now()}.mp4`;
+    const tempOutputPath = `/tmp/output_${Date.now()}_${quality}.mp4`;
+
+    // Quality settings for space optimization
+    const qualitySettings = {
+      '480p': {
+        scale: '854:480',
+        bitrate: '800k',
+        maxrate: '1200k',
+        bufsize: '1600k'
+      },
+      '720p': {
+        scale: '1280:720', 
+        bitrate: '1500k',
+        maxrate: '2250k',
+        bufsize: '3000k'
+      },
+      '1080p': {
+        scale: '1920:1080',
+        bitrate: '3000k',
+        maxrate: '4500k',
+        bufsize: '6000k'
+      }
+    };
+
+    const settings = qualitySettings[quality] || qualitySettings['720p'];
+
+    // Write input buffer to temp file
+    fs.writeFile(tempInputPath, inputBuffer)
+      .then(() => {
+        const ffmpegArgs = [
+          '-i', tempInputPath,
+          '-c:v', 'libx264',
+          '-preset', 'medium',
+          '-crf', '23',
+          '-vf', `scale=${settings.scale}`,
+          '-b:v', settings.bitrate,
+          '-maxrate', settings.maxrate,
+          '-bufsize', settings.bufsize,
+          '-c:a', 'aac',
+          '-b:a', '128k',
+          '-movflags', '+faststart',
+          '-y',
+          tempOutputPath
+        ];
+
+        const ffmpeg = spawn('ffmpeg', ffmpegArgs);
+
+        ffmpeg.on('close', async (code) => {
+          try {
+            // Clean up input file
+            await fs.unlink(tempInputPath).catch(() => {});
+
+            if (code === 0) {
+              // Read processed file
+              const processedBuffer = await fs.readFile(tempOutputPath);
+              
+              // Clean up output file
+              await fs.unlink(tempOutputPath).catch(() => {});
+              
+              resolve({
+                buffer: processedBuffer,
+                quality,
+                originalSize: inputBuffer.length,
+                compressedSize: processedBuffer.length,
+                compressionRatio: ((inputBuffer.length - processedBuffer.length) / inputBuffer.length * 100).toFixed(2)
+              });
+            } else {
+              reject(new Error(`FFmpeg process failed with code ${code}`));
+            }
+          } catch (error) {
+            reject(error);
+          }
+        });
+
+        ffmpeg.on('error', (error) => {
+          reject(error);
+        });
+      })
+      .catch(reject);
+  });
+};
+
+// Generate video thumbnail with FFmpeg
+const generateThumbnail = async (inputBuffer, timestamp = 5) => {
+  return new Promise((resolve, reject) => {
+    const tempInputPath = `/tmp/input_${Date.now()}.mp4`;
+    const tempThumbnailPath = `/tmp/thumb_${Date.now()}.jpg`;
+
+    fs.writeFile(tempInputPath, inputBuffer)
+      .then(() => {
+        const ffmpegArgs = [
+          '-i', tempInputPath,
+          '-ss', timestamp.toString(),
+          '-vframes', '1',
+          '-vf', 'scale=854:480',
+          '-q:v', '2',
+          '-y',
+          tempThumbnailPath
+        ];
+
+        const ffmpeg = spawn('ffmpeg', ffmpegArgs);
+
+        ffmpeg.on('close', async (code) => {
+          try {
+            await fs.unlink(tempInputPath).catch(() => {});
+
+            if (code === 0) {
+              const thumbnailBuffer = await fs.readFile(tempThumbnailPath);
+              await fs.unlink(tempThumbnailPath).catch(() => {});
+              resolve(thumbnailBuffer);
+            } else {
+              reject(new Error(`Thumbnail generation failed with code ${code}`));
+            }
+          } catch (error) {
+            reject(error);
+          }
+        });
+
+        ffmpeg.on('error', reject);
+      })
+      .catch(reject);
+  });
+};
+
+// Enhanced upload video with compression and multiple qualities
 const uploadVideo = asyncHandler(async (req, res) => {
   if (!req.file) {
     throw new AppError('No video file provided', 400);
@@ -75,7 +205,8 @@ const uploadVideo = asyncHandler(async (req, res) => {
     duration,
     genre,
     language,
-    tags
+    tags,
+    generateQualities = true
   } = req.body;
 
   // Validate content exists
@@ -88,22 +219,80 @@ const uploadVideo = asyncHandler(async (req, res) => {
   }
 
   try {
-    // Upload video using unified storage service
-    const uploadResult = await storageService.uploadVideo(
-      req.file.buffer,
-      {
-        originalName: req.file.originalname,
-        contentId: content?._id,
-        episodeNumber: parseInt(episodeNumber),
-        seasonNumber: parseInt(seasonNumber),
-        quality: '720p'
-      }
-    );
-
+    console.log('🎬 Starting video processing...');
+    
     // Generate episode ID
     const episodeId = `episode_${Date.now()}_${uuidv4().slice(0, 8)}`;
+    
+    const uploadResults = [];
+    const qualityOptions = [];
 
-    // Create episode with CDN URLs
+    // Define qualities to generate for space optimization
+    const qualities = generateQualities ? ['480p', '720p'] : ['720p']; // Reduced to save space in development
+    
+    // Process video for different qualities
+    for (const quality of qualities) {
+      console.log(`📹 Processing ${quality} quality...`);
+      
+      try {
+        // Compress video with FFmpeg
+        const processedVideo = await processVideoWithFFmpeg(req.file.buffer, null, quality);
+        
+        console.log(`✅ ${quality} compressed: ${processedVideo.compressionRatio}% reduction`);
+
+        // Upload compressed video to Cloudflare R2
+        const uploadResult = await storageService.uploadVideo(
+          processedVideo.buffer,
+          {
+            originalName: req.file.originalname,
+            contentId: content?._id,
+            episodeNumber: parseInt(episodeNumber),
+            seasonNumber: parseInt(seasonNumber),
+            quality: quality
+          }
+        );
+
+        uploadResults.push(uploadResult);
+        
+        // Add to quality options
+        qualityOptions.push({
+          resolution: quality,
+          url: uploadResult.cdnUrl || uploadResult.publicUrl,
+          fileSize: processedVideo.compressedSize,
+          bitrate: quality === '480p' ? '800k' : quality === '720p' ? '1500k' : '3000k'
+        });
+
+      } catch (qualityError) {
+        console.error(`❌ Failed to process ${quality}:`, qualityError.message);
+        // Continue with other qualities
+      }
+    }
+
+    if (uploadResults.length === 0) {
+      throw new AppError('Failed to process video in any quality', 500);
+    }
+
+    // Generate thumbnail
+    console.log('🖼️ Generating thumbnail...');
+    let thumbnailUrl = '';
+    try {
+      const thumbnailBuffer = await generateThumbnail(req.file.buffer, 5);
+      const thumbnailUpload = await storageService.uploadImage(thumbnailBuffer, {
+        type: 'thumbnail',
+        contentId: content?._id,
+        episodeId: episodeId,
+        originalName: `${episodeId}_thumbnail.jpg`
+      });
+      thumbnailUrl = thumbnailUpload.cdnUrl || thumbnailUpload.publicUrl;
+      console.log('✅ Thumbnail generated successfully');
+    } catch (thumbError) {
+      console.error('⚠️ Thumbnail generation failed:', thumbError.message);
+    }
+
+    // Use the best quality (720p) as primary
+    const primaryUpload = uploadResults.find(r => r.fileName.includes('720p')) || uploadResults[0];
+
+    // Create episode with multiple quality options
     const episode = await Episode.create({
       episodeId,
       contentId: content?._id,
@@ -111,20 +300,23 @@ const uploadVideo = asyncHandler(async (req, res) => {
       seasonNumber: parseInt(seasonNumber),
       title,
       description: description || '',
-      videoUrl: uploadResult.publicUrl,
-      thumbnailUrl: '', // Will be updated separately
+      videoUrl: primaryUpload.publicUrl,
+      thumbnailUrl,
       duration: parseInt(duration),
+      qualityOptions,
       fileInfo: {
-        fileName: uploadResult.fileName,
-        fileSize: uploadResult.size,
+        fileName: primaryUpload.fileName,
+        fileSize: primaryUpload.size,
         contentType: req.file.mimetype,
-        uploadedAt: uploadResult.uploadedAt
+        uploadedAt: primaryUpload.uploadedAt
       },
-      cdnUrls: {
-        video: uploadResult.cdnUrl || uploadResult.publicUrl,
-        streaming: storageService.getStreamingUrl(uploadResult.fileName)
+      streamingOptions: {
+        isPreloadEnabled: true,
+        preloadDuration: 10,
+        adaptiveBitrate: true,
+        chunkSize: 1048576
       },
-      status: 'processing'
+      status: 'published' // Auto-publish in development
     });
 
     // Update content if exists
@@ -146,42 +338,203 @@ const uploadVideo = asyncHandler(async (req, res) => {
       await content.save();
     }
 
-    // Purge CDN cache for related content
-    try {
-      await cdnService.purgeCache([
-        uploadResult.cdnUrl,
-        `/api/content/${contentId}`,
-        `/api/feed/random`
-      ]);
-    } catch (cdnError) {
-      console.error('CDN cache purge failed:', cdnError);
-      // Don't fail the upload for CDN issues
-    }
-
     // Clear relevant app caches
     await deleteCache('feed:*');
     await deleteCache('trending:*');
     await deleteCache('popular:*');
 
+    // Calculate total space saved
+    const totalOriginalSize = req.file.size * qualities.length;
+    const totalCompressedSize = uploadResults.reduce((sum, result) => sum + result.size, 0);
+    const totalSpaceSaved = ((totalOriginalSize - totalCompressedSize) / totalOriginalSize * 100).toFixed(2);
+
     res.status(201).json({
       success: true,
-      message: `Video uploaded successfully to ${storageService.getProvider()}`,
+      message: 'Video processed and uploaded successfully with optimization',
       data: {
         episode,
-        uploadResult: {
-          fileName: uploadResult.fileName,
-          publicUrl: uploadResult.publicUrl,
-          cdnUrl: uploadResult.cdnUrl,
-          size: uploadResult.size,
+        uploadResults: uploadResults.map(result => ({
+          quality: result.fileName.match(/_(480p|720p|1080p)_/)?.[1] || 'unknown',
+          publicUrl: result.publicUrl,
+          cdnUrl: result.cdnUrl,
+          size: result.size,
+          sizeFormatted: videoService.formatBytes(result.size)
+        })),
+        optimization: {
+          qualitiesGenerated: qualities,
+          thumbnailGenerated: !!thumbnailUrl,
+          totalSpaceSaved: `${totalSpaceSaved}%`,
           provider: storageService.getProvider()
+        },
+        streaming: {
+          adaptiveBitrate: true,
+          qualityOptions: qualityOptions.length,
+          preloadEnabled: true
         }
       }
     });
 
   } catch (error) {
-    console.error('Video upload failed:', error);
-    throw new AppError(`Failed to upload video: ${error.message}`, 500);
+    console.error('❌ Video upload and processing failed:', error);
+    throw new AppError(`Failed to process and upload video: ${error.message}`, 500);
   }
+});
+
+// Batch upload multiple videos with processing
+const batchUploadVideos = asyncHandler(async (req, res) => {
+  if (!req.files || req.files.length === 0) {
+    throw new AppError('No video files provided', 400);
+  }
+
+  const { contentId, seasonNumber = 1 } = req.body;
+  
+  // Validate content exists
+  const content = await Content.findById(contentId);
+  if (!content) {
+    throw new AppError('Content not found', 404);
+  }
+
+  const results = [];
+  const errors = [];
+
+  console.log(`🎬 Starting batch processing of ${req.files.length} videos...`);
+
+  // Process videos in parallel (limited concurrency to save resources)
+  const concurrency = 2; // Process 2 videos at a time
+  
+  for (let i = 0; i < req.files.length; i += concurrency) {
+    const batch = req.files.slice(i, i + concurrency);
+    
+    const batchPromises = batch.map(async (file, index) => {
+      const episodeNumber = i + index + 1;
+      
+      try {
+        // Create a mock request object for uploadVideo function
+        const mockReq = {
+          file,
+          body: {
+            title: `Episode ${episodeNumber}`,
+            description: `Episode ${episodeNumber} of ${content.title}`,
+            contentId,
+            episodeNumber,
+            seasonNumber,
+            duration: 1800, // Default 30 minutes
+            generateQualities: true
+          }
+        };
+
+        // Process video (reuse the logic from uploadVideo)
+        const qualities = ['480p', '720p'];
+        const uploadResults = [];
+        const qualityOptions = [];
+
+        for (const quality of qualities) {
+          const processedVideo = await processVideoWithFFmpeg(file.buffer, null, quality);
+          
+          const uploadResult = await storageService.uploadVideo(
+            processedVideo.buffer,
+            {
+              originalName: file.originalname,
+              contentId: content._id,
+              episodeNumber,
+              seasonNumber: parseInt(seasonNumber),
+              quality
+            }
+          );
+
+          uploadResults.push(uploadResult);
+          qualityOptions.push({
+            resolution: quality,
+            url: uploadResult.cdnUrl || uploadResult.publicUrl,
+            fileSize: processedVideo.compressedSize,
+            bitrate: quality === '480p' ? '800k' : '1500k'
+          });
+        }
+
+        // Generate thumbnail
+        const thumbnailBuffer = await generateThumbnail(file.buffer, 5);
+        const thumbnailUpload = await storageService.uploadImage(thumbnailBuffer, {
+          type: 'thumbnail',
+          contentId: content._id,
+          episodeId: `episode_${Date.now()}_${episodeNumber}`,
+          originalName: `episode_${episodeNumber}_thumbnail.jpg`
+        });
+
+        const primaryUpload = uploadResults.find(r => r.fileName.includes('720p')) || uploadResults[0];
+
+        // Create episode
+        const episode = await Episode.create({
+          episodeId: `episode_${Date.now()}_${uuidv4().slice(0, 8)}`,
+          contentId: content._id,
+          episodeNumber,
+          seasonNumber: parseInt(seasonNumber),
+          title: `Episode ${episodeNumber}`,
+          description: `Episode ${episodeNumber} of ${content.title}`,
+          videoUrl: primaryUpload.publicUrl,
+          thumbnailUrl: thumbnailUpload.cdnUrl || thumbnailUpload.publicUrl,
+          duration: 1800,
+          qualityOptions,
+          fileInfo: {
+            fileName: primaryUpload.fileName,
+            fileSize: primaryUpload.size,
+            contentType: file.mimetype,
+            uploadedAt: new Date()
+          },
+          streamingOptions: {
+            isPreloadEnabled: true,
+            preloadDuration: 10,
+            adaptiveBitrate: true
+          },
+          status: 'published'
+        });
+
+        results.push({
+          episodeNumber,
+          episode,
+          uploadResults: uploadResults.length,
+          thumbnailGenerated: true
+        });
+
+        console.log(`✅ Episode ${episodeNumber} processed successfully`);
+
+      } catch (error) {
+        console.error(`❌ Episode ${episodeNumber} failed:`, error.message);
+        errors.push({
+          episodeNumber,
+          error: error.message,
+          fileName: file.originalname
+        });
+      }
+    });
+
+    await Promise.allSettled(batchPromises);
+  }
+
+  // Update content with new episodes
+  const episodeIds = results.map(r => r.episode._id);
+  content.episodeIds.push(...episodeIds);
+  content.totalEpisodes = content.episodeIds.length;
+  await content.save();
+
+  // Clear caches
+  await deleteCache('feed:*');
+  await deleteCache('trending:*');
+
+  res.status(200).json({
+    success: true,
+    message: 'Batch video processing completed',
+    data: {
+      totalFiles: req.files.length,
+      successful: results.length,
+      failed: errors.length,
+      results,
+      errors,
+      contentUpdated: {
+        totalEpisodes: content.totalEpisodes,
+        newEpisodesAdded: results.length
+      }
+    }
+  });
 });
 
 // Update content feed settings
@@ -482,13 +835,28 @@ const deleteContent = asyncHandler(async (req, res) => {
   // Get all episodes
   const episodes = await Episode.find({ contentId: content._id });
 
-  // Delete videos from GCP if requested
+  // Delete videos from storage if requested
   if (deleteVideos) {
     for (const episode of episodes) {
       try {
-        await deleteVideoFromGCP(episode.fileInfo.fileName);
+        // Delete main video file
+        await storageService.deleteFile(episode.fileInfo.fileName);
+        
+        // Delete quality variants
+        if (episode.qualityOptions) {
+          for (const quality of episode.qualityOptions) {
+            const qualityFileName = quality.url.split('/').pop();
+            await storageService.deleteFile(qualityFileName);
+          }
+        }
+        
+        // Delete thumbnail
+        if (episode.thumbnailUrl) {
+          const thumbnailFileName = episode.thumbnailUrl.split('/').pop();
+          await storageService.deleteFile(thumbnailFileName);
+        }
       } catch (error) {
-        console.error(`Failed to delete video ${episode.fileInfo.fileName}:`, error);
+        console.error(`Failed to delete files for episode ${episode._id}:`, error);
       }
     }
   }
@@ -653,6 +1021,7 @@ const getSystemHealth = asyncHandler(async (req, res) => {
 module.exports = {
   createContent,
   uploadVideo,
+  batchUploadVideos,
   updateFeedSettings,
   publishContent,
   getContentAnalytics,

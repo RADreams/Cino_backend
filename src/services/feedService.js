@@ -14,7 +14,8 @@ class FeedService {
       limit = 20,
       offset = 0,
       userId = null,
-      excludeWatched = false
+      excludeWatched = false,
+      enablePrefetch = true // New option for prefetch
     } = options;
 
     try {
@@ -72,12 +73,372 @@ class FeedService {
       // Get first episode for each content
       const feedWithEpisodes = await this._attachFirstEpisodes(paginatedContent);
 
+      // Enhanced prefetch logic for smooth experience
+      if (enablePrefetch && feedWithEpisodes.length > 0) {
+        console.log('🚀 Starting prefetch for next episodes...');
+        
+        // Prefetch logic for next 5-7 episodes
+        const prefetchData = await this._prefetchNextEpisodes(feedWithEpisodes, userId);
+        
+        // Add prefetch data to response
+        feedWithEpisodes.forEach((item, index) => {
+          if (prefetchData[index]) {
+            item._prefetchData = prefetchData[index];
+          }
+        });
+      }
+
       return feedWithEpisodes;
 
     } catch (error) {
       console.error('Feed generation error:', error);
       throw error;
     }
+  }
+
+  /**
+   * Enhanced prefetch logic for next 5-7 episodes
+   */
+  async _prefetchNextEpisodes(feedContent, userId = null) {
+    const prefetchCount = 7; // Prefetch next 7 episodes
+    const prefetchData = [];
+
+    try {
+      // Process each content item in the feed
+      for (let i = 0; i < Math.min(feedContent.length, prefetchCount); i++) {
+        const contentItem = feedContent[i];
+        
+        try {
+          // Get next episodes for this content
+          const nextEpisodes = await this._getNextEpisodes(
+            contentItem._id, 
+            contentItem.firstEpisode?.episodeNumber || 1,
+            5 // Get next 5 episodes
+          );
+
+          // Get user's progress for prefetch optimization
+          let watchProgress = null;
+          if (userId && nextEpisodes.length > 0) {
+            watchProgress = await this._getUserProgressForEpisodes(
+              userId, 
+              nextEpisodes.map(ep => ep._id)
+            );
+          }
+
+          // Prepare prefetch URLs with optimized quality
+          const prefetchEpisodes = nextEpisodes.map(episode => {
+            const userProgress = watchProgress?.[episode._id.toString()];
+            
+            return {
+              _id: episode._id,
+              episodeId: episode.episodeId,
+              episodeNumber: episode.episodeNumber,
+              title: episode.title,
+              duration: episode.duration,
+              thumbnailUrl: episode.thumbnailUrl,
+              // Use lower quality for prefetch to save bandwidth
+              prefetchUrl: this._getPrefetchUrl(episode, 'low'),
+              streamUrl: this._getPrefetchUrl(episode, 'medium'),
+              watchProgress: userProgress || {
+                currentPosition: 0,
+                percentageWatched: 0,
+                isCompleted: false
+              },
+              prefetchPriority: i + 1 // Higher priority for earlier episodes
+            };
+          });
+
+          prefetchData.push({
+            contentId: contentItem._id,
+            nextEpisodes: prefetchEpisodes,
+            totalEpisodesAvailable: nextEpisodes.length,
+            prefetchStrategy: 'sequential',
+            estimatedBandwidth: this._calculatePrefetchBandwidth(prefetchEpisodes)
+          });
+
+        } catch (episodeError) {
+          console.error(`Prefetch failed for content ${contentItem._id}:`, episodeError);
+          
+          // Add empty prefetch data to maintain array consistency
+          prefetchData.push({
+            contentId: contentItem._id,
+            nextEpisodes: [],
+            totalEpisodesAvailable: 0,
+            prefetchStrategy: 'none',
+            error: 'Prefetch failed'
+          });
+        }
+      }
+
+      // Background prefetch caching (don't await this)
+      this._cachePrefetchData(prefetchData, userId);
+
+      console.log(`✅ Prefetch completed for ${prefetchData.length} content items`);
+      return prefetchData;
+
+    } catch (error) {
+      console.error('Prefetch process error:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Get next episodes for a content
+   */
+  async _getNextEpisodes(contentId, currentEpisodeNumber, limit = 5) {
+    return Episode.find({
+      contentId,
+      status: 'published',
+      episodeNumber: { $gt: currentEpisodeNumber }
+    })
+    .sort({ seasonNumber: 1, episodeNumber: 1 })
+    .limit(limit)
+    .select('episodeId episodeNumber seasonNumber title duration thumbnailUrl videoUrl qualityOptions streamingOptions')
+    .lean();
+  }
+
+  /**
+   * Get user progress for multiple episodes
+   */
+  async _getUserProgressForEpisodes(userId, episodeIds) {
+    const progressData = await Watchlist.find({
+      userId,
+      episodeId: { $in: episodeIds }
+    })
+    .select('episodeId watchProgress')
+    .lean();
+
+    return progressData.reduce((acc, item) => {
+      acc[item.episodeId.toString()] = {
+        currentPosition: item.watchProgress.currentPosition,
+        percentageWatched: item.watchProgress.percentageWatched,
+        isCompleted: item.watchProgress.isCompleted
+      };
+      return acc;
+    }, {});
+  }
+
+  /**
+   * Get prefetch URL with quality optimization
+   */
+  _getPrefetchUrl(episode, quality = 'low') {
+    // Quality mapping for prefetch optimization
+    const qualityMapping = {
+      low: '480p',
+      medium: '720p',
+      high: '1080p'
+    };
+
+    const targetQuality = qualityMapping[quality] || '480p';
+
+    // Check if episode has quality options
+    if (episode.qualityOptions && episode.qualityOptions.length > 0) {
+      const qualityOption = episode.qualityOptions.find(q => q.resolution === targetQuality);
+      if (qualityOption) {
+        return qualityOption.url;
+      }
+      
+      // Fallback to lowest quality for prefetch
+      const lowestQuality = episode.qualityOptions.sort((a, b) => {
+        const resolutionOrder = { '480p': 1, '720p': 2, '1080p': 3, '4k': 4 };
+        return resolutionOrder[a.resolution] - resolutionOrder[b.resolution];
+      })[0];
+      
+      return lowestQuality.url;
+    }
+
+    // Fallback to main video URL
+    return episode.videoUrl;
+  }
+
+  /**
+   * Calculate estimated bandwidth for prefetch
+   */
+  _calculatePrefetchBandwidth(prefetchEpisodes) {
+    let totalSize = 0;
+    
+    prefetchEpisodes.forEach(episode => {
+      // Estimate size based on duration and quality
+      // Assuming 480p = ~1MB per minute
+      const estimatedSizePerMinute = 1024 * 1024; // 1MB
+      const durationInMinutes = (episode.duration || 1800) / 60;
+      totalSize += durationInMinutes * estimatedSizePerMinute;
+    });
+
+    return {
+      totalEstimatedSize: totalSize,
+      formattedSize: this._formatBytes(totalSize),
+      estimatedDownloadTime: Math.ceil(totalSize / (1024 * 1024 * 2)), // Assuming 2MB/s connection
+      prefetchParts: prefetchEpisodes.length
+    };
+  }
+
+  /**
+   * Format bytes to human readable format
+   */
+  _formatBytes(bytes) {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  }
+
+  /**
+   * Cache prefetch data for future use
+   */
+  async _cachePrefetchData(prefetchData, userId) {
+    try {
+      const cacheKey = `prefetch:${userId || 'anonymous'}:${Date.now()}`;
+      
+      // Cache prefetch data for 10 minutes
+      await setCache(cacheKey, {
+        data: prefetchData,
+        timestamp: new Date(),
+        userId: userId || null
+      }, 600);
+
+      // Store prefetch URLs in separate cache for quick access
+      for (const item of prefetchData) {
+        if (item.nextEpisodes.length > 0) {
+          const episodeCacheKey = `prefetch:episode:${item.contentId}`;
+          await setCache(
+            episodeCacheKey, 
+            item.nextEpisodes.slice(0, 3), // Cache first 3 episodes
+            1200 // 20 minutes
+          );
+        }
+      }
+
+    } catch (error) {
+      console.error('Failed to cache prefetch data:', error);
+    }
+  }
+
+  /**
+   * Get cached prefetch data
+   */
+  async getCachedPrefetchData(contentId, userId = null) {
+    try {
+      const cacheKey = `prefetch:episode:${contentId}`;
+      const cachedData = await getCache(cacheKey);
+      
+      if (cachedData) {
+        console.log(`📦 Returning cached prefetch data for content ${contentId}`);
+        return cachedData;
+      }
+
+      return null;
+    } catch (error) {
+      console.error('Failed to get cached prefetch data:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Smart prefetch based on user behavior
+   */
+  async smartPrefetch(userId, contentId, currentEpisodeNumber) {
+    try {
+      // Get user's viewing pattern
+      const userPattern = await this._getUserViewingPattern(userId);
+      
+      // Determine prefetch count based on user behavior
+      let prefetchCount = 3; // Default
+      
+      if (userPattern.averageEpisodesPerSession > 5) {
+        prefetchCount = 7; // User binges, prefetch more
+      } else if (userPattern.averageEpisodesPerSession < 2) {
+        prefetchCount = 2; // User watches less, prefetch less
+      }
+
+      // Get next episodes with smart count
+      const nextEpisodes = await this._getNextEpisodes(
+        contentId, 
+        currentEpisodeNumber, 
+        prefetchCount
+      );
+
+      // Prioritize based on user preferences
+      const prioritizedEpisodes = await this._prioritizeEpisodes(nextEpisodes, userPattern);
+
+      return {
+        episodes: prioritizedEpisodes,
+        strategy: 'smart',
+        basedOn: {
+          averageSession: userPattern.averageEpisodesPerSession,
+          prefetchCount,
+          userPriorities: userPattern.preferences
+        }
+      };
+
+    } catch (error) {
+      console.error('Smart prefetch error:', error);
+      return { episodes: [], strategy: 'fallback' };
+    }
+  }
+
+  /**
+   * Get user viewing pattern for smart prefetch
+   */
+  async _getUserViewingPattern(userId) {
+    try {
+      const recentSessions = await Watchlist.aggregate([
+        {
+          $match: {
+            userId,
+            'sessionInfo.lastWatchedAt': {
+              $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) // Last 7 days
+            }
+          }
+        },
+        {
+          $group: {
+            _id: {
+              date: { $dateToString: { format: '%Y-%m-%d', date: '$sessionInfo.lastWatchedAt' } }
+            },
+            episodesWatched: { $sum: 1 },
+            totalWatchTime: { $sum: '$watchProgress.currentPosition' },
+            genres: { $addToSet: '$contentId' }
+          }
+        },
+        {
+          $group: {
+            _id: null,
+            averageEpisodesPerSession: { $avg: '$episodesWatched' },
+            averageWatchTime: { $avg: '$totalWatchTime' },
+            totalSessions: { $sum: 1 }
+          }
+        }
+      ]);
+
+      const pattern = recentSessions[0] || {
+        averageEpisodesPerSession: 3,
+        averageWatchTime: 1200,
+        totalSessions: 1
+      };
+
+      return pattern;
+    } catch (error) {
+      console.error('Failed to get user viewing pattern:', error);
+      return {
+        averageEpisodesPerSession: 3,
+        averageWatchTime: 1200,
+        totalSessions: 1
+      };
+    }
+  }
+
+  /**
+   * Prioritize episodes based on user pattern
+   */
+  async _prioritizeEpisodes(episodes, userPattern) {
+    // Simple prioritization - can be enhanced with ML
+    return episodes.map((episode, index) => ({
+      ...episode,
+      prefetchPriority: userPattern.averageEpisodesPerSession > 5 ? index + 1 : episodes.length - index,
+      estimatedWatchLikelihood: Math.max(0.9 - (index * 0.1), 0.3) // Decreasing likelihood
+    }));
   }
 
   /**
@@ -303,7 +664,8 @@ class FeedService {
           title: episode.title,
           thumbnailUrl: episode.thumbnailUrl,
           duration: episode.duration,
-          streamUrl: episode.streamUrl || episode.videoUrl
+          streamUrl: episode.streamUrl || episode.videoUrl,
+          qualityOptions: episode.qualityOptions || []
         } : null,
         _feedSource: contentItem._feedSource,
         _algorithmScore: contentItem._algorithmScore
@@ -403,7 +765,8 @@ class FeedService {
       },
       limit,
       userId,
-      excludeWatched: true
+      excludeWatched: true,
+      enablePrefetch: true // Enable prefetch for history-based feeds
     });
   }
 
