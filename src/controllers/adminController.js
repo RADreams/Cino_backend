@@ -8,6 +8,8 @@ const gcpService = require('../services/gcpService');
 const { deleteCache, flushCache } = require('../config/redis');
 const { asyncHandler, AppError } = require('../middleware/errorHandler');
 const { v4: uuidv4 } = require('uuid');
+const storageService = require('../services/storageService');
+const cdnService = require('../services/cdnService');
 
 // Create new content
 const createContent = asyncHandler(async (req, res) => {
@@ -85,13 +87,9 @@ const uploadVideo = asyncHandler(async (req, res) => {
     }
   }
 
-  // Generate unique filename
-  const timestamp = Date.now();
-  const fileName = `videos/${contentId || 'standalone'}/episode_${episodeNumber}_${timestamp}.mp4`;
-  
   try {
-    // Upload to GCP using the service
-    const uploadResult = await gcpService.uploadVideo(
+    // Upload video using unified storage service
+    const uploadResult = await storageService.uploadVideo(
       req.file.buffer,
       {
         originalName: req.file.originalname,
@@ -103,9 +101,9 @@ const uploadVideo = asyncHandler(async (req, res) => {
     );
 
     // Generate episode ID
-    const episodeId = `episode_${timestamp}_${uuidv4().slice(0, 8)}`;
+    const episodeId = `episode_${Date.now()}_${uuidv4().slice(0, 8)}`;
 
-    // Create episode
+    // Create episode with CDN URLs
     const episode = await Episode.create({
       episodeId,
       contentId: content?._id,
@@ -122,7 +120,11 @@ const uploadVideo = asyncHandler(async (req, res) => {
         contentType: req.file.mimetype,
         uploadedAt: uploadResult.uploadedAt
       },
-      status: 'processing' // Will be updated to 'published' after processing
+      cdnUrls: {
+        video: uploadResult.cdnUrl || uploadResult.publicUrl,
+        streaming: storageService.getStreamingUrl(uploadResult.fileName)
+      },
+      status: 'processing'
     });
 
     // Update content if exists
@@ -144,27 +146,41 @@ const uploadVideo = asyncHandler(async (req, res) => {
       await content.save();
     }
 
-    // Clear relevant caches
+    // Purge CDN cache for related content
+    try {
+      await cdnService.purgeCache([
+        uploadResult.cdnUrl,
+        `/api/content/${contentId}`,
+        `/api/feed/random`
+      ]);
+    } catch (cdnError) {
+      console.error('CDN cache purge failed:', cdnError);
+      // Don't fail the upload for CDN issues
+    }
+
+    // Clear relevant app caches
     await deleteCache('feed:*');
     await deleteCache('trending:*');
     await deleteCache('popular:*');
 
     res.status(201).json({
       success: true,
-      message: 'Video uploaded successfully',
+      message: `Video uploaded successfully to ${storageService.getProvider()}`,
       data: {
         episode,
         uploadResult: {
           fileName: uploadResult.fileName,
           publicUrl: uploadResult.publicUrl,
-          size: uploadResult.size
+          cdnUrl: uploadResult.cdnUrl,
+          size: uploadResult.size,
+          provider: storageService.getProvider()
         }
       }
     });
 
   } catch (error) {
     console.error('Video upload failed:', error);
-    throw new AppError('Failed to upload video', 500);
+    throw new AppError(`Failed to upload video: ${error.message}`, 500);
   }
 });
 
